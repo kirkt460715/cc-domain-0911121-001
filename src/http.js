@@ -1,6 +1,6 @@
 import http from 'node:http';
 import {LedgerError, errorDocument, fail} from './errors.js';
-import {jsonParse, integer, secureEqual} from './value.js';
+import {jsonParse, integer, secureEqual, identifier} from './value.js';
 
 async function body(request, maximum) {
   const chunks = [];
@@ -53,6 +53,7 @@ function queryParameters(url) {
 export function createServer(ledger, options = {}) {
   const maximum = integer(options.maximumBody ?? 8 * 1024 * 1024, 'maximumBody', 1024);
   const token = options.token ?? null;
+  const manager = options.manager ?? null;
   const server = http.createServer(async (request, response) => {
     try {
       if (token && !secureEqual(request.headers.authorization, `Bearer ${token}`)) {
@@ -85,6 +86,21 @@ export function createServer(ledger, options = {}) {
             break;
           case '/batches':
             result = await ledger.batches(query);
+            break;
+          case '/streams':
+            result = await ledger.streamStatus();
+            break;
+          case '/stream/status':
+            result = await ledger.streamStatus(query.id);
+            break;
+          case '/stream/runtime':
+            if (!manager) {
+              fail('STREAM_MANAGER', 'No stream manager is attached to this server', {}, 503);
+            }
+            result = manager.status(query.id);
+            break;
+          case '/stream/deadletters':
+            result = await ledger.streamDeadLetters(query);
             break;
           case '/audit':
             result = await ledger.audit(query);
@@ -168,6 +184,45 @@ export function createServer(ledger, options = {}) {
           case '/impact':
             result = await ledger.impact(input);
             break;
+          case '/streams':
+            if (!manager) {
+              fail('STREAM_MANAGER', 'No stream manager is attached to this server', {}, 503);
+            }
+            result = await manager.register(input);
+            break;
+          case '/stream/pause':
+            if (!manager) {
+              fail('STREAM_MANAGER', 'No stream manager is attached to this server', {}, 503);
+            }
+            result = await manager.pause(identifier(input.id, 'id'));
+            break;
+          case '/stream/resume':
+            if (!manager) {
+              fail('STREAM_MANAGER', 'No stream manager is attached to this server', {}, 503);
+            }
+            result = await manager.resume(identifier(input.id, 'id'));
+            break;
+          case '/stream/stop':
+            if (!manager) {
+              fail('STREAM_MANAGER', 'No stream manager is attached to this server', {}, 503);
+            }
+            result = await manager.stop(identifier(input.id, 'id'));
+            break;
+          case '/stream/reconfigure':
+            if (!manager) {
+              fail('STREAM_MANAGER', 'No stream manager is attached to this server', {}, 503);
+            }
+            result = await manager.reconfigure(identifier(input.id, 'id'), input.patch ?? {});
+            break;
+          case '/stream/reconnect':
+            if (!manager) {
+              fail('STREAM_MANAGER', 'No stream manager is attached to this server', {}, 503);
+            }
+            result = await manager.reconnect(identifier(input.id, 'id'));
+            break;
+          case '/stream/deadletters/reprocess':
+            result = await ledger.reprocessDeadLetter(input, actor);
+            break;
           default:
             fail('NOT_FOUND', 'Endpoint does not exist', {}, 404);
         }
@@ -186,9 +241,9 @@ export function createServer(ledger, options = {}) {
   server.keepAliveTimeout = 1000;
   return server;
 }
-export async function listen(ledger, {port = 8080, token} = {}) {
+export async function listen(ledger, {port = 8080, token, manager} = {}) {
   integer(port, 'port', 0, 65535);
-  const server = createServer(ledger, {token});
+  const server = createServer(ledger, {token, manager});
   await new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(port, '127.0.0.1', resolve);

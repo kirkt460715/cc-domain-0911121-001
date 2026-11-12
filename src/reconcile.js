@@ -127,5 +127,40 @@ export function auditState(state) {
       }
     }
   }
+  for (const stream of Object.values(state.streams)) {
+    if (!state.sources[stream.source]) {
+      findings.push({code: 'STREAM_SOURCE', id: stream.id});
+    }
+    const counters = {delivered: 0, duplicates: 0, deadletters: 0, conflicts: 0};
+    for (const delivery of Object.values(state.streamDeliveries)) {
+      if (delivery.streamId !== stream.id) {
+        continue;
+      }
+      if (!state.batches[delivery.batchId]) {
+        findings.push({code: 'STREAM_DELIVERY_BATCH', id: stream.id, key: delivery.key});
+      }
+      // 每个不透明事件恰好对应一条 delivery 记录；重发在同一记录上累计 redeliveries。
+      counters.delivered += 1;
+      counters.duplicates += delivery.redeliveries ?? 0;
+    }
+    for (const item of Object.values(state.streamDeadLetters)) {
+      if (item.streamId !== stream.id) {
+        continue;
+      }
+      if (item.status !== 'open' && !item.resolution) {
+        findings.push({code: 'STREAM_DL_RESOLUTION', id: item.id});
+      }
+      counters.deadletters += 1;
+      if (item.reasonCode === 'SSE_EVENT_CONFLICT') {
+        counters.conflicts += 1;
+      }
+    }
+    for (const [name, value] of Object.entries(counters)) {
+      if (stream.counters[name] !== value) {
+        findings.push({code: 'STREAM_COUNTERS', id: stream.id, counter: name,
+          expected: value, actual: stream.counters[name]});
+      }
+    }
+  }
   return {valid: findings.length === 0, sequence: state.sequence, findings};
 }

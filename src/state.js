@@ -15,6 +15,9 @@ export function emptyState() {
     rules: {},
     alerts: {},
     exports: {},
+    streams: {},
+    streamDeliveries: {},
+    streamDeadLetters: {},
     audits: [],
   };
 }
@@ -88,6 +91,45 @@ export function applyEvent(state, event) {
       const record = lookup(state, 'exports', data.id);
       record.revoked = true;
       record.reason = data.reason;
+      break;
+    }
+    case 'stream.registered':
+    case 'stream.updated':
+      state.streams[data.id] = clone(data);
+      break;
+    case 'stream.delivered': {
+      const before = state.streamDeliveries[data.key];
+      state.streamDeliveries[data.key] = clone(data);
+      state.streams[data.streamId].position = data.eventId;
+      if (data.outcome === 'applied' && !before) {
+        // 每个不透明事件只在首次投递时计数，journal 重放不重复累加。
+        state.streams[data.streamId].counters.delivered += 1;
+      } else if (data.outcome === 'duplicate') {
+        // 只对本次新增的重发计数，重复投影同一条事件不会累加。
+        const added = (data.redeliveries ?? 0) - (before?.redeliveries ?? 0);
+        state.streams[data.streamId].counters.duplicates += Math.max(added, 0);
+      }
+      break;
+    }
+    case 'stream.deadlettered': {
+      const already = state.streamDeadLetters[data.id];
+      state.streamDeadLetters[data.id] = clone(data);
+      if (data.advancePosition !== false) {
+        state.streams[data.streamId].position = data.eventId;
+      }
+      // 死信按 id 幂等：仅首次出现时计数，journal 重放不重复累加。
+      if (!already) {
+        state.streams[data.streamId].counters.deadletters += 1;
+        if (data.reasonCode === 'SSE_EVENT_CONFLICT') {
+          state.streams[data.streamId].counters.conflicts += 1;
+        }
+      }
+      break;
+    }
+    case 'stream.deadletter.resolved': {
+      const item = lookup(state, 'streamDeadLetters', data.id);
+      item.status = data.status;
+      item.resolution = clone(data);
       break;
     }
     case 'audit.recorded':

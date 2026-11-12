@@ -6,6 +6,7 @@ import {auditTransactions, stateAtSequence, lineageGraph} from './provenance.js'
 import {inspectBackup, restoreBackup, compareBackupToStore} from './restore.js';
 import {rollingSummary, dailyCoverage, thresholdRuns} from './resampling.js';
 import {listen} from './http.js';
+import {StreamManager} from './streamManager.js';
 import {errorDocument, fail} from './errors.js';
 import {jsonParse, integer} from './value.js';
 import {runImport, replayImportPlan} from './pipeline.js';
@@ -22,7 +23,7 @@ export function argumentsFor(argv) {
     }
     options[key.slice(2)] = value;
   }
-  const allowed = ['root', 'input', 'id', 'actor', 'port', 'destination', 'expected-sequence', 'files-root', 'preview'];
+  const allowed = ['root', 'input', 'id', 'actor', 'port', 'destination', 'expected-sequence', 'files-root', 'preview', 'url', 'manager'];
   for (const key of Object.keys(options)) {
     if (!allowed.includes(key)) {
       fail('ARGUMENTS', `Unknown option: ${key}`);
@@ -53,6 +54,7 @@ export async function execute(argv) {
         'flatlines', 'disagreements', 'freshness', 'inventory', 'reconcile', 'impact',
         'status', 'catalog', 'batches', 'audit', 'verify', 'checkpoint', 'backup',
         'journal-audit', 'historical-status', 'lineage', 'restore', 'backup-inspect', 'backup-compare', 'rolling', 'coverage', 'runs', 'recover-lock', 'import', 'import-plan', 'operations', 'region', 'scorecard', 'serve',
+        'stream-register', 'stream-pause', 'stream-resume', 'stream-stop', 'stream-reconfigure', 'stream-status', 'stream-runtime', 'stream-deadletters', 'stream-reprocess', 'stream-run',
       ],
       rules: 'All input dates include explicit timezone. State remains under --root. No downloads are required.',
     };
@@ -179,11 +181,62 @@ export async function execute(argv) {
     case 'scorecard':
       return sourceScorecard(await ledger.store.read(), options.id);
     case 'serve': {
-      const server = await listen(ledger, {port: Number(options.port ?? 8080), token: process.env.FIELD_LEDGER_TOKEN});
-      const stop = () => server.close();
+      const manager = options.manager === 'true' ? new StreamManager(ledger) : null;
+      if (manager) {
+        await manager.start();
+      }
+      const server = await listen(ledger, {port: Number(options.port ?? 8080), token: process.env.FIELD_LEDGER_TOKEN, manager});
+      const stop = () => {
+        server.close();
+        manager?.close();
+      };
       process.once('SIGINT', stop);
       process.once('SIGTERM', stop);
-      return {listening: server.address(), authentication: Boolean(process.env.FIELD_LEDGER_TOKEN)};
+      return {listening: server.address(), authentication: Boolean(process.env.FIELD_LEDGER_TOKEN),
+        streamManager: Boolean(manager)};
+    }
+    case 'stream-register': {
+      // 一次性命令：只持久化订阅配置，连接循环由 serve/stream-run 承载。
+      const manager = new StreamManager(ledger, {detached: true});
+      return manager.register(input);
+    }
+    case 'stream-pause':
+      return new StreamManager(ledger, {detached: true}).pause(options.id);
+    case 'stream-resume':
+      return new StreamManager(ledger, {detached: true}).resume(options.id);
+    case 'stream-stop':
+      return new StreamManager(ledger, {detached: true}).stop(options.id);
+    case 'stream-reconfigure':
+      return new StreamManager(ledger, {detached: true}).reconfigure(options.id, input);
+    case 'stream-reprocess':
+      return ledger.reprocessDeadLetter(input, actor);
+    case 'stream-deadletters':
+      return ledger.streamDeadLetters({...input, streamId: input.streamId ?? options.id});
+    case 'stream-status':
+      return ledger.streamStatus(options.id);
+    case 'stream-runtime':
+      return new StreamManager(ledger, {detached: true}).status(options.id);
+    case 'stream-run': {
+      // 独立进程驱动一次订阅，直到进入 idle/error/paused/stopped，或位置稳定 settleMs。
+      const manager = new StreamManager(ledger);
+      const id = options.id ?? input.id;
+      const timeoutMs = Number(input.timeoutMs ?? 60000);
+      const settleMs = Number(input.settleMs ?? 1500);
+      try {
+        const existing = await ledger.streamStatus(id);
+        if (existing.status === 'error' || existing.status === 'idle') {
+          // 上次运行留下的可恢复状态：显式恢复后再启动连接循环。
+          await manager.resume(id);
+        }
+        await manager.start();
+        const durable = await manager.waitFor(id, (state, runtime) =>
+          ['idle', 'error', 'paused', 'stopped'].includes(state.status) ||
+          runtime.phase === 'idle' || runtime.phase === 'error',
+          {timeoutMs, settleMs});
+        return {stream: durable, runtime: manager.status(id)};
+      } finally {
+        await manager.close();
+      }
     }
     default:
       fail('COMMAND', `Unknown command: ${command}`);

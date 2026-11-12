@@ -7,6 +7,7 @@ import * as alerting from './alerts.js';
 import * as snapshots from './exports.js';
 import * as quality from './quality.js';
 import * as reconciliation from './reconcile.js';
+import * as streams from './streams.js';
 import {event, summary, projectEvents} from './state.js';
 import {clone, digest, identifier, text} from './value.js';
 import {requireValue} from './errors.js';
@@ -165,5 +166,37 @@ export class Ledger {
   async recoverLock() {
     await this.store.initialize();
     return recoverDeadLock(this.store.root);
+  }
+  async registerStream(input, actor) {
+    return this.mutate('stream.register', actor, state => streams.registerStream(state, input));
+  }
+  async controlStream(id, status, actor) {
+    return this.mutate('stream.control', actor, state => streams.controlStream(state, id, status));
+  }
+  async reconfigureStream(id, patch, actor) {
+    return this.mutate('stream.reconfigure', actor, state => streams.reconfigureStream(state, id, patch));
+  }
+  async noteStreamError(id, error, actor = 'stream-manager') {
+    return this.mutate('stream.error', actor, state => streams.noteStreamError(state, id, error));
+  }
+  async noteStreamIdle(id, actor = 'stream-manager') {
+    return this.mutate('stream.idle', actor, state => streams.noteStreamIdle(state, id));
+  }
+  async deliverStreamMessage(streamId, message, actor = 'stream-manager') {
+    return this.mutate('stream.deliver', actor, state => streams.deliverStreamMessage(state, streamId, message));
+  }
+  async streamDeadLetters(query) {
+    return streams.listStreamDeadLetters(await this.store.read(), query ?? {});
+  }
+  async reprocessDeadLetter(input, actor) {
+    return this.mutate('stream.deadletter.reprocess', actor, state => streams.reprocessDeadLetter(state, input));
+  }
+  async streamStatus(id) {
+    const state = await this.store.read();
+    if (id) {
+      requireValue(state.streams[id], 'STREAM_MISSING', 'Subscription does not exist');
+      return state.streams[id];
+    }
+    return Object.values(state.streams);
   }
 }
